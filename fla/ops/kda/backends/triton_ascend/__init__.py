@@ -5,7 +5,68 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-"""Triton-Ascend Ascend NPU backend for KDA ops."""
+"""Triton-Ascend Ascend NPU backend for KDA ops.
+
+Naming scheme (kda backend + wrappers):
+- Device kernels (``@triton.jit``, launched directly) end with
+  ``..._kernel_<variant>_npu`` (variant tags such as ``_fold``,
+  ``_decay_table``, ``_nc2``, ``_ilp`` sit between the base kernel name and
+  the ``_npu`` suffix).
+- Host entry points are ``<public op name>_npu`` with no ``kernel`` token
+  (e.g. ``chunk_kda_fwd_intra_npu`` wraps ``chunk_kda_fwd_kernel_*_npu``).
+- Private device-side jit helpers and host helpers carry a leading ``_``;
+  the ``_npu`` tag on them is optional.
+
+FLA_KDA_* environment switches (complete list; all are read once at module
+import or per call as noted, and all have permanent in-process fallbacks on
+launch failure):
+
+===============================  ==============  ==========================================
+Switch                           Default         Effect
+===============================  ==============  ==========================================
+FLA_KDA_TAIL_ILP                 ``1`` (on)      chunk_fwd_tail: ``1`` selects the
+                                                 ILP-rescheduled fused h+o tail kernel
+                                                 (bit-identical); ``0``/``false``/``off``
+                                                 restore the serial-schedule kernel.
+FLA_KDA_FUSED_TAIL_BV            unset (=128)    chunk_fwd_tail: fused h+o tail V-block
+                                                 width override for bench sweeps; only
+                                                 16/32/64/128 are honoured, other or
+                                                 unparsable values are ignored.
+FLA_KDA_TAIL_GRID_CLAMP          ``1`` (on)      chunk_fwd_tail: m5 clamp hygiene —
+                                                 ``0`` restores the grid=num_aicore
+                                                 launch; the default launches
+                                                 min(num_aicore, task_num) blocks so no
+                                                 MIX block binds a cube core just to
+                                                 run an empty task loop.
+FLA_KDA_TAIL_BV_POLICY           ``0`` (off)     chunk_fwd_tail: ``1`` re-enables d1's
+                                                 occupancy policy (BV 128->64 when the
+                                                 128-wide grid under-fills the cube
+                                                 cores). Default OFF: the C bench matrix
+                                                 measured +14% e2e pollution from it.
+FLA_KDA_DH_GRID_CLAMP            ``1`` (on)      chunk_delta_h (fwd_h oneslab/blockdim64
+                                                 + bwd dhu): m5 clamp hygiene — ``0``
+                                                 restores the grid=num_aicore launch on
+                                                 all three persistent launches of that
+                                                 module.
+FLA_KDA_RETAIN_ACTIVATION_BUDGET 8 GiB           fla/ops/kda/chunk.py (wrapper, not this
+                                                 package): activation retain budget in
+                                                 bytes for the bwd recompute-skip
+                                                 heuristic; ``0`` always recomputes.
+FLA_KDA_ATEM_FUSE               ``1`` (on)      w1v2 aten-tail lever (combo18 default):
+                                                 fwd chunk_local_cumsum persistent
+                                                 producer dual-store a head-major
+                                                 [B, H, T, S] fp32 copy of the cumsum'd
+                                                 gate (w4 producer-copy doctrine); the
+                                                 fwd recompute_w_u stage and the bwd wy
+                                                 stage (via save_for_backward retention)
+                                                 consume it directly, dropping both host
+                                                 fp32 gate transposes (~1.7ms each
+                                                 @t128k). ``0`` = byte-exact current
+                                                 path; any dual failure latches off for
+                                                 the process and the host transposes
+                                                 run.
+===============================  ==============  ==========================================
+"""
 
 from __future__ import annotations
 
@@ -143,3 +204,44 @@ class TritonAscendKDABackend(BaseBackend):
         from fla.ops.kda.backends.triton_ascend.fused_recurrent import fused_recurrent_kda_fwd_npu
 
         return fused_recurrent_kda_fwd_npu(*args, **kwargs)
+
+    def chunk_kda_fwd_stage0_4_verifier(self, *args, **kwargs):
+        import torch
+
+        k = kwargs.get('k')
+        v = kwargs.get('v')
+        if not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
+            return False, 'fused small-T stage0_4 needs k/v tensors'
+        if kwargs.get('cu_seqlens') is not None or kwargs.get('chunk_indices') is not None:
+            return False, 'fused small-T stage0_4 supports non-varlen inputs only'
+        if kwargs.get('use_graph'):
+            return False, 'fused small-T stage0_4 does not support use_graph'
+        if not kwargs.get('safe_gate'):
+            return False, 'fused small-T stage0_4 requires safe_gate'
+        if kwargs.get('chunk_size') != 64:
+            return False, f"fused small-T stage0_4 requires chunk_size 64, got {kwargs.get('chunk_size')}"
+        if kwargs.get('scale') is None:
+            return False, 'fused small-T stage0_4 requires an explicit scale'
+        if k.dim() != 4:
+            return False, f'fused small-T stage0_4 expects 4D k, got {k.dim()}D'
+        B, T, H, K = k.shape
+        HV, V = v.shape[2], v.shape[-1]
+        if T not in (2048, 4096):
+            return False, f'fused small-T stage0_4 is gated to the production small-T shapes T in (2048, 4096), got T={T} (bench: 2048 fwd 1.587x one-task-per-program grid; 4096 goes persistent-24, the pre-persistent grid benched 0.908x; other T keeps the staged pipeline so backend routing stays observable)'
+        if K > 128 or V > 128:
+            return False, f'fused small-T stage0_4 requires K,V <= 128, got K={K}, V={V}'
+        if HV % H != 0:
+            return False, f'fused small-T stage0_4 requires HV % H == 0, got HV={HV}, H={H}'
+        # single launch: keep programs within the Ascend task-time budget and
+        # every linear offset comfortably inside int32 (bases stay int64 anyway)
+        if (T // 64) * B * HV > 4096:
+            return False, 'fused small-T stage0_4 exceeds the 4096-program launch budget'
+        if B * T * HV * max(K, V) > (1 << 31):
+            return False, 'fused small-T stage0_4 exceeds int32-safe element budget'
+        if k.dtype != v.dtype or k.dtype.is_floating_point is False:
+            return False, f'fused small-T stage0_4 requires matching float dtypes, got {k.dtype}/{v.dtype}'
+        return True, None
+
+    def chunk_kda_fwd_stage0_4(self, *args, **kwargs):
+        from fla.ops.kda.backends.triton_ascend.chunk_fwd_small_t import chunk_kda_fwd_stage0_4_npu
+        return chunk_kda_fwd_stage0_4_npu(*args, **kwargs)

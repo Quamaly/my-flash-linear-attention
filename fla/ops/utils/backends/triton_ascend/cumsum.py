@@ -21,17 +21,25 @@ from fla.utils.ascend_ub_manager import (
     iter_axis_launch_chunks,
     max_grid_axis_chunks,
 )
+from fla.utils.launch_fast import fast_launch
 
 _NUM_WARPS = 4
 # Peak live fp32 tiles: b_s, b_o (and b_z / partial sums for vector/global).
 _CUMSUM_SCALAR_MEM_MULT = 3.0
-# b_s, b_c, b_z, plus tl.cumsum multi-buffer on [BT, BS] tiles.
-_CUMSUM_VECTOR_MEM_MULT = 8.0
+# Peak live fp32 tiles for the local vector kernel: b_s, b_o and one
+# tl.cumsum scan temp on a [BT, BS] tile (the scan is column-independent,
+# so no extra cross-column buffers). 4.0 keeps [64,128] fp32 (~128KB
+# estimated peak) inside 0.85x of a 192KB..256KB UB, and lets BS reach S
+# so each program streams full contiguous rows.
+_CUMSUM_VECTOR_MEM_MULT = 4.0
 _CUMSUM_SAFETY_MARGIN = 0.85
 _FALLBACK_BT_GLOBAL = 32
 _FALLBACK_BS_LOCAL = 32
 _FALLBACK_BS_GLOBAL = 16
 _MAX_BT_GLOBAL = 256
+# Persistent-launch cap for the vector local cumsum: one program per AIV core
+# (48 on the target Ascend device). Scheduling-only knob; never changes math.
+_CUMSUM_PERSISTENT_MAX_CORES = 48
 
 
 def _get_global_scalar_bt(T: int) -> int:
@@ -86,6 +94,61 @@ def _get_global_vector_tile_config(T: int, S: int) -> tuple[int, int]:
     return BT, BS
 
 
+def _use_persistent_local_cumsum_vector(g: torch.Tensor) -> bool:
+    """Guard for the persistent vector-cumsum launch.
+
+    Shared file (gla/gdn/kda and other cumsum consumers route through here).
+    The persistent kernel assumes the exact dense ``[B, T, H, S]`` contiguous
+    layout (strides are normalized by ``input_guard`` in the callers); only
+    that layout may take the single-launch path. Anything else keeps the
+    chunked-grid fallback path.
+    """
+    return g.dim() == 4 and g.is_contiguous()
+
+
+def _launch_local_cumsum_vector_persistent(
+    *,
+    g_org,
+    g,
+    g_t_out=None,
+    scale,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    B,
+    H,
+    S,
+    BT,
+    BS,
+    NT,
+    reverse,
+):
+    ns = triton.cdiv(S, BS)
+    task_num = ns * NT * B * H
+    # one program per AIV core, capped at 48; fewer when there is less work
+    num_core = min(get_multiprocessor_count(), _CUMSUM_PERSISTENT_MAX_CORES, task_num)
+    fast_launch(
+        chunk_local_cumsum_vector_persistent_kernel_npu, (num_core,),
+        s=g_org,
+        o=g,
+        o_t_out=g_t_out,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        B=B,
+        NT=NT,
+        task_num=task_num,
+        H=H,
+        S=S,
+        BT=BT,
+        BS=BS,
+        NS=ns,
+        REVERSE=reverse,
+        num_warps=_NUM_WARPS,
+    )
+
+
 def _launch_local_cumsum_vector(
     *,
     g_org,
@@ -131,7 +194,7 @@ def _launch_local_cumsum_vector(
         for bh_off in range(0, bh_total, max_bh):
             bh_len = min(max_bh, bh_total - bh_off)
             kernel_kwargs['BH_OFFSET'] = bh_off
-            chunk_local_cumsum_vector_kernel_npu[(ns, nt_len, bh_len)](**kernel_kwargs)
+            fast_launch(chunk_local_cumsum_vector_kernel_npu, (ns, nt_len, bh_len), **kernel_kwargs)
 
 
 @triton.heuristics({
@@ -193,6 +256,10 @@ def chunk_local_cumsum_scalar_kernel_npu(
 @triton.heuristics({
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    # When BS divides S exactly every tile is full along the feature axis,
+    # so the dim-1 boundary predication (per-row masks on the mte3 store
+    # path) can be folded away at compile time.
+    'S_TILED': lambda args: args['S'] % args['BS'] == 0,
 })
 @triton.jit(do_not_specialize=['T'])
 def chunk_local_cumsum_vector_kernel_npu(
@@ -210,6 +277,7 @@ def chunk_local_cumsum_vector_kernel_npu(
     REVERSE: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    S_TILED: tl.constexpr,
     NT_OFFSET: tl.constexpr,
     BH_OFFSET: tl.constexpr,
 ):
@@ -227,14 +295,116 @@ def chunk_local_cumsum_vector_kernel_npu(
 
     p_s = tl.make_block_ptr(s + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
     p_o = tl.make_block_ptr(o + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+    if S_TILED:
+        # Full rows along S: contiguous, unpredicated mte2/mte3 transfers.
+        b_s = tl.load(p_s, boundary_check=(0,)).to(tl.float32)
+    else:
+        b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
     if REVERSE:
         b_o = tl.cumsum(b_s, axis=0, reverse=True)
     else:
         b_o = tl.cumsum(b_s, axis=0)
     if HAS_SCALE:
         b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    if S_TILED:
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
+    else:
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.heuristics({
+    'HAS_SCALE': lambda args: args['scale'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+    'HAS_O_T': lambda args: args['o_t_out'] is not None,
+})
+@triton.jit(do_not_specialize=['T', 'NT', 'task_num'])
+def chunk_local_cumsum_vector_persistent_kernel_npu(
+    s,
+    o,
+    o_t_out,
+    scale,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    B: tl.constexpr,
+    NT,
+    task_num,
+    H: tl.constexpr,
+    S: tl.constexpr,
+    BS: tl.constexpr,
+    BT: tl.constexpr,
+    NS: tl.constexpr,
+    REVERSE: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    HAS_O_T: tl.constexpr,
+):
+    # Persistent single-launch variant of chunk_local_cumsum_vector_kernel_npu:
+    # grid=(num_core,) with each core striding task_id in [core_id, task_num).
+    # Scheduling-only restructure -- the per-task tile math (loads, fp32 cumsum,
+    # scale, boundary-checked stores) is byte-identical to the chunked-grid
+    # kernel, and tiles are independent so execution order cannot change results.
+    core_id = tl.program_id(0)
+    num_core = tl.num_programs(0)
+    # Full (pre-varlen) T for the head-major dual store's base offset; the
+    # loop body reassigns T to the per-sequence length under IS_VARLEN.
+    T_total = T.to(tl.int64)
+    for tid in tl.range(core_id, task_num, num_core):
+        # widen before decomposing; task ids stay int64 end to end
+        task_id = tl.cast(tid, tl.int64)
+        i_s = task_id % NS
+        rem = task_id // NS
+        i_t = rem % NT
+        i_bh = rem // NT
+        i_b, i_h = i_bh // H, i_bh % H
+        if IS_VARLEN:
+            i_n, i_t = (
+                tl.load(chunk_indices + i_t * 2).to(tl.int32),
+                tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            )
+            bos, eos = (
+                tl.load(cu_seqlens + i_n).to(tl.int64),
+                tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+            )
+            T = (eos - bos).to(tl.int32)
+        else:
+            bos = tl.cast(i_b, tl.int64) * T
+            eos = bos + T
+
+        # rebind pointers per task (fresh block ptrs each iteration; ptr-args are
+        # never accumulated across tasks). no padding tasks exist: task_num is
+        # exact (ns * NT * B * H) and tl.range never runs past it, partial edge
+        # tiles are handled by boundary_check exactly as in the chunked-grid
+        # kernel. base offsets stay int64 (bos*H*S carries the magnitude);
+        # block-ptr offsets are cast to int32 -- identical values to the
+        # chunked-grid kernel's int32 program-id offsets (i_t*BT <= T+BT fits
+        # int32 since T is int32).
+        o_t = tl.cast(i_t * BT, tl.int32)
+        o_s = tl.cast(i_s * BS, tl.int32)
+        p_s = tl.make_block_ptr(s + (bos * H + i_h) * S, (T, S), (H*S, 1), (o_t, o_s), (BT, BS), (1, 0))
+        p_o = tl.make_block_ptr(o + (bos * H + i_h) * S, (T, S), (H*S, 1), (o_t, o_s), (BT, BS), (1, 0))
+        b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+        if REVERSE:
+            b_o = tl.cumsum(b_s, axis=0, reverse=True)
+        else:
+            b_o = tl.cumsum(b_s, axis=0)
+        if HAS_SCALE:
+            b_o *= scale
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        if HAS_O_T:
+            # w4/y3 producer-copy doctrine: dual-store the SAME live b_o tile
+            # into the caller's head-major [B, H, T, S] buffer so T-contig
+            # consumers (kda recompute_w_u / bwd wy) skip the host fp32
+            # transpose. The tile store is a plain make_block_ptr with the
+            # same (1, 0) order and boundary_check class as the native store
+            # above -- no new tiles, UB envelope unchanged. HAS_O_T=0 (every
+            # existing caller) folds this away at compile time.
+            if IS_VARLEN:
+                o_t_out_base = o_t_out + i_h * T_total * S + bos * S
+            else:
+                o_t_out_base = o_t_out + (i_b * H + i_h) * T_total * S
+            p_o_t_out = tl.make_block_ptr(o_t_out_base, (T, S), (S, 1), (o_t, o_s), (BT, BS), (1, 0))
+            tl.store(p_o_t_out, b_o.to(p_o_t_out.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.heuristics({
@@ -358,7 +528,8 @@ def chunk_local_cumsum_scalar_npu(
     num_core = get_multiprocessor_count()
     task_num = num_blocks * B * H
     grid = (num_core,)
-    chunk_local_cumsum_scalar_kernel_npu[grid](
+    fast_launch(
+        chunk_local_cumsum_scalar_kernel_npu, grid,
         s=g_org,
         o=g,
         scale=scale,
@@ -384,6 +555,7 @@ def chunk_local_cumsum_vector_npu(
     output_dtype: torch.dtype | None = torch.float,
     chunk_indices: torch.LongTensor | None = None,
     use_graph: bool = False,
+    g_t_out: torch.Tensor | None = None,
     **kwargs,
 ) -> torch.Tensor:
     if 'head_first' in kwargs:
@@ -404,8 +576,42 @@ def chunk_local_cumsum_vector_npu(
         BS,
         max_grid=ASCEND_MAX_GRID_DIM,
     )
+    # tl.arange needs a power-of-2 BS; the S clamp above can produce e.g.
+    # BS=S=100 for non-power-of-2 feature dims, so snap down to be safe.
+    BS = triton.next_power_of_2(BS + 1) // 2
     # graph 模式下未覆盖行须为 0：kda_gate_bwd 对输出做全量归约，脏行会污染 dA/dbias
     g_org, g = g, (torch.zeros_like if use_graph else torch.empty_like)(g, dtype=output_dtype or g.dtype)
+    # g_t_out contract (gate.py g_t_out precedent): on normal return the
+    # buffer holds the head-major [B, H, T, S] copy of g. The dual store only
+    # rides the persistent forward launch; reverse / non-persistent / dtype
+    # mismatch fall back to the host copy so the caller never sees a
+    # half-filled buffer.
+    dual = (
+        g_t_out is not None and not reverse and not use_graph
+        and g_t_out.dtype == g.dtype and g_t_out.is_contiguous()
+        and tuple(g_t_out.shape) == (B, H, T, S)
+    )
+    if _use_persistent_local_cumsum_vector(g):
+        # single launch, <= 48 persistent programs (AIV core count)
+        _launch_local_cumsum_vector_persistent(
+            g_org=g_org,
+            g=g,
+            g_t_out=g_t_out if dual else None,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            B=B,
+            H=H,
+            S=S,
+            BT=BT,
+            BS=BS,
+            NT=NT,
+            reverse=reverse,
+        )
+        if g_t_out is not None and not dual:
+            g_t_out.copy_(g.transpose(1, 2))
+        return g
     _launch_local_cumsum_vector(
         g_org=g_org,
         g=g,
@@ -421,6 +627,8 @@ def chunk_local_cumsum_vector_npu(
         NT=NT,
         reverse=reverse,
     )
+    if g_t_out is not None:
+        g_t_out.copy_(g.transpose(1, 2))
     return g
 
 
@@ -556,6 +764,7 @@ def chunk_local_cumsum_npu(
     output_dtype: torch.dtype | None = torch.float,
     chunk_indices: torch.LongTensor | None = None,
     use_graph: bool = False,
+    g_t_out: torch.Tensor | None = None,
     **kwargs,
 ) -> torch.Tensor:
     if 'head_first' in kwargs:
@@ -565,7 +774,7 @@ def chunk_local_cumsum_npu(
     if cu_seqlens is not None:
         assert g.shape[0] == 1, "Only batch size 1 is supported when cu_seqlens are provided"
     if len(g.shape) == 3:
-        return chunk_local_cumsum_scalar_npu(
+        out = chunk_local_cumsum_scalar_npu(
             g=g,
             chunk_size=chunk_size,
             reverse=reverse,
@@ -575,6 +784,9 @@ def chunk_local_cumsum_npu(
             chunk_indices=chunk_indices,
             use_graph=use_graph,
         )
+        if g_t_out is not None:
+            g_t_out.copy_(out.transpose(1, 2))
+        return out
     if len(g.shape) == 4:
         return chunk_local_cumsum_vector_npu(
             g=g,
@@ -585,6 +797,7 @@ def chunk_local_cumsum_npu(
             output_dtype=output_dtype,
             chunk_indices=chunk_indices,
             use_graph=use_graph,
+            g_t_out=g_t_out,
         )
     raise ValueError(
         f"Unsupported input shape {g.shape}, "

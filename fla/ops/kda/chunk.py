@@ -7,6 +7,7 @@
 
 # Related files are modified and supported by the Moonshot AI Team
 
+import os
 import warnings
 
 import torch
@@ -16,9 +17,54 @@ from fla.ops.backends import dispatch
 from fla.ops.common.gate import fused_beta_sigmoid, fused_beta_sigmoid_bwd
 from fla.ops.cp import FLACPContext
 from fla.ops.kda.chunk_bwd import chunk_kda_bwd
-from fla.ops.kda.chunk_fwd import chunk_kda_fwd
+from fla.ops.kda.chunk_fwd import chunk_kda_fwd, _atem_fuse_enabled
 from fla.ops.utils.index import prepare_chunk_indices, prepare_chunk_indices_static
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla.utils import IS_NPU, autocast_custom_bwd, autocast_custom_fwd, input_guard
+
+# Backward-retention heuristic (NPU): with ``disable_recompute=False`` the
+# forward frees w/u/qg/kg/v_new/h and backward rebuilds them
+# (kda_gate_chunk_cumsum + recompute_w_u_fwd + chunk_gated_delta_rule_fwd_h,
+# i.e. one extra full fwd_h state pass per backward). When the extra retained
+# activation memory fits a budget we instead keep those tensors and take the
+# existing ``disable_recompute=True`` save path, skipping the whole recompute
+# block. The retained tensors come from the same deterministic kernels, so
+# numerics are unchanged. Override the budget (bytes) with
+# FLA_KDA_RETAIN_ACTIVATION_BUDGET; set it to 0 to always recompute.
+_KDA_RETAIN_BUDGET_BYTES = 8 * 1024**3
+_KDA_RETAIN_BUDGET_ENV = "FLA_KDA_RETAIN_ACTIVATION_BUDGET"
+
+
+def _kda_retention_budget() -> int:
+    raw = os.environ.get(_KDA_RETAIN_BUDGET_ENV)
+    if raw is not None:
+        try:
+            value = int(raw)
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+    return _KDA_RETAIN_BUDGET_BYTES
+
+
+def _kda_retention_extra_bytes(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    chunk_size: int,
+    keep_g: bool,
+    keep_gate_t: bool = False,
+) -> int:
+    """Activation bytes held alive for backward when the recompute is skipped."""
+    B, T, H, K = q.shape
+    HV, V = v.shape[2], v.shape[-1]
+    esz = q.element_size()
+    NT = (T + chunk_size - 1) // chunk_size
+    # w, qg, kg are [B, T, HV, K]; u, v_new are [B, T, HV, V];
+    # h is [B, NT, HV, K, V]; the fp32 gate chunk-cumsum is only kept
+    # additionally when the gate is computed in kernel; keep_gate_t adds the
+    # ATEM dual-store head-major fp32 gate copy (FLA_KDA_ATEM_FUSE).
+    per_token = HV * (3 * K + 2 * V) * esz + (HV * K * 4 if keep_g else 0) \
+        + (HV * K * 4 if keep_gate_t else 0)
+    return B * (T * per_token + NT * HV * K * V * esz)
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -55,9 +101,32 @@ class ChunkKDAFunction(torch.autograd.Function):
     ):
         # Apply l2norm
         q_rstd, k_rstd = None, None
+        qk_l2norm_out = None
         if use_qk_l2norm_in_kernel:
-            q, q_rstd = l2norm_fwd(q)
-            k, k_rstd = l2norm_fwd(k)
+            if IS_NPU and safe_gate and chunk_size in (32, 64) and not use_graph:
+                # NPU fold: the NPU intra head kernel (persistent sub-chunk
+                # pipeline or the small-T fused intra kernel) is the
+                # first q/k consumer - it normalizes rows in-register (the exact
+                # l2norm_fwd math) and materializes the normalized q/k plus the
+                # row rstd for every later consumer (inter_solve, recompute,
+                # h/o tail, backward, l2norm_bwd). The two standalone
+                # l2norm_fwd launches and their raw q/k read pass are skipped.
+                # rstd lands in a [2, B, H, T] working buffer (stride-1 per
+                # head, the only store shape this kernel's UB model accepts)
+                # and is transposed to the [B, T, H] l2norm interface in one
+                # fused copy after the fwd pass.
+                Bq, Tq, Hq = q.shape[0], q.shape[1], q.shape[2]
+                rstd_buf = q.new_empty((2, Bq, Hq, Tq), dtype=torch.float32)
+                qk_l2norm_out = {
+                    'q': torch.empty_like(q),
+                    'k': torch.empty_like(k),
+                    'q_rstd': rstd_buf[0],
+                    'k_rstd': rstd_buf[1],
+                    'rstd_buf': rstd_buf,
+                }
+            else:
+                q, q_rstd = l2norm_fwd(q)
+                k, k_rstd = l2norm_fwd(k)
 
         beta_raw = beta
         if use_beta_sigmoid_in_kernel:
@@ -84,7 +153,29 @@ class ChunkKDAFunction(torch.autograd.Function):
 
         g_input = g
 
-        (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state) = chunk_kda_fwd(
+        # NPU: skip the backward recompute when keeping w/u/qg/kg/v_new/h
+        # (plus the fp32 gate chunk-cumsum) for backward fits the budget.
+        # Uses the existing disable_recompute=True save path unchanged.
+        # T >= 8192 gate: the recompute skip only pays off at production-scale
+        # sequence lengths; small-T runs keep the recompute path (and its
+        # sub-op dispatch) intact.
+        if (
+            not disable_recompute
+            and IS_NPU
+            and q.shape[1] >= 8192
+            and not return_intermediate_states
+            and not use_graph
+            and cp_context is None
+            and _kda_retention_extra_bytes(
+                q, v, chunk_size, use_gate_in_kernel,
+                # the ATEM head-major gate copy is only produced on the
+                # plain-cumsum path (use_gate_in_kernel=False)
+                keep_gate_t=_atem_fuse_enabled() and not use_gate_in_kernel,
+            ) <= _kda_retention_budget()
+        ):
+            disable_recompute = True
+
+        (o, final_state, g_cumsum, g_t, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state) = chunk_kda_fwd(
             q=q,
             k=k,
             v=v,
@@ -108,7 +199,17 @@ class ChunkKDAFunction(torch.autograd.Function):
             state_v_first=state_v_first,
             use_graph=use_graph,
             chunk_offsets=chunk_offsets,
+            qk_l2norm_out=qk_l2norm_out,
         )
+
+        if qk_l2norm_out is not None:
+            # swap in the normalized q/k materialized inside the fwd pass and
+            # produce the [B, T, H] rstd interface tensors (single fused copy);
+            # the backward (chunk_kda_bwd + l2norm_bwd) consumes them exactly
+            # as it consumed the standalone-l2norm outputs before
+            q, k = qk_l2norm_out['q'], qk_l2norm_out['k']
+            rstd = qk_l2norm_out['rstd_buf'].transpose(2, 3).contiguous()
+            q_rstd, k_rstd = rstd[0], rstd[1]
 
         if return_intermediate_states:
             assert torch.is_inference_mode_enabled(), "return_intermediate_states is only allowed in inference mode"
@@ -116,7 +217,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             return o.type_as(q), final_state, h
 
         ctx.save_for_backward(
-            q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta_raw, beta, A_log, dt_bias, Aqk, Akk,
+            q, q_rstd, k, k_rstd, v, g_cumsum, g_t, g_input, beta_raw, beta, A_log, dt_bias, Aqk, Akk,
             w, u, qg, kg, v_new, h,
             initial_state, cu_seqlens, chunk_indices, chunk_offsets
         )
@@ -142,7 +243,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor,
     ):
-        (q, q_rstd, k, k_rstd, v, g_cumsum, g_input, beta_raw, beta, A_log, dt_bias, Aqk, Akk,
+        (q, q_rstd, k, k_rstd, v, g_cumsum, g_t, g_input, beta_raw, beta, A_log, dt_bias, Aqk, Akk,
          w, u, qg, kg, v_new, h,
          initial_state, cu_seqlens, chunk_indices, chunk_offsets) = (
             ctx.saved_tensors
@@ -160,6 +261,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             do=do,
             dht=dht,
             g=g_cumsum,
+            g_t=g_t,
             g_org=g_input if ctx.use_gate_in_kernel else None,
             state_v_first=ctx.state_v_first,
             cu_seqlens=cu_seqlens,
@@ -180,6 +282,9 @@ class ChunkKDAFunction(torch.autograd.Function):
             h=h,
             use_graph=ctx.use_graph,
             chunk_offsets=chunk_offsets,
+            # gate backward needs fp32 dg; otherwise the reverse cumsum can
+            # store the grad dtype directly and the return cast becomes a no-op
+            dg_dtype=torch.float if ctx.use_gate_in_kernel else g_input.dtype,
         )
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)

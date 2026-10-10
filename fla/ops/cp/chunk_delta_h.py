@@ -965,6 +965,11 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process(
     if context is None or context.group is None:
         return dht, initial_state
     assert dht is None, "When enable CP, the provided dht must be None."
+    # Layout handoff guard: on a mixed dispatch the Ascend dAv producer may
+    # hand over dv as a [B, HV, T, V] storage view; the kernels below index
+    # dv with native strides, so normalize first (no-op for contiguous inputs).
+    if not dv.is_contiguous():
+        dv = dv.contiguous()
     use_tf32x3_affine_chain = context.use_tf32x3_affine_chain
     if use_tf32x3_affine_chain and not IS_TF32_SUPPORTED:
         warnings.warn(

@@ -16,6 +16,7 @@ import triton.language as tl
 from fla.ops.utils.op import exp
 from fla.ops.utils.softplus import softplus
 from fla.utils import input_guard
+from fla.utils.launch_fast import fast_launch
 from fla.utils.ascend_ub_manager import (
     ASCEND_MAX_GRID_DIM,
     compute_row_tile_block_size,
@@ -364,6 +365,6 @@ def fused_recurrent_kda_fwd_npu(
     for task_off in range(0, task_num, max_tasks):
         task_len = min(max_tasks, task_num - task_off)
         kernel_kwargs["TASK_OFFSET"] = task_off
-        fused_recurrent_kda_fwd_kernel_npu[(task_len,)](**kernel_kwargs)
+        fast_launch(fused_recurrent_kda_fwd_kernel_npu, (task_len,), **kernel_kwargs)
 
     return out, final_state

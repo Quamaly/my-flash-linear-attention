@@ -17,6 +17,8 @@ optimal block sizes based on UB capacity constraints to prevent UB overflow.
 import os
 import warnings
 
+import functools
+
 import torch
 import triton
 import triton.runtime.driver as driver
@@ -29,6 +31,16 @@ ASCEND_LAUNCH_BLOCK_BUDGET = 4096
 _FALLBACK_MAX_FUSED_BLOCK = 65536 // 2
 # Conservative UB fallback when runtime detection is unavailable (64 KiB).
 _FALLBACK_UB_CAPACITY_BITS = 65536 * 8
+# Ascend 910B* effective unified-buffer envelope: triton-ascend compiles
+# kernels against 196608 B (192 KiB) of UB. Keeping the 64 KiB global fallback
+# on a 910B* when detection fails silently shrinks every analytic tile pick
+# (e.g. KDA/gated-delta-rule fwd_h drops from the oneslab BK=BV=128 kernel to
+# blockdim64 with 2 K-slabs, NV=2 and boundary checks on every tile).
+_ASCEND_910B_UB_BYTES = 196608
+
+
+def _is_ascend_910b(npu_model: str) -> bool:
+    return "910B" in npu_model.upper()
 
 
 def is_npu_available() -> bool:
@@ -46,7 +58,13 @@ def is_npu_available() -> bool:
         return False
 
 
-def _fallback_ub_capacity(reason: str) -> int:
+def _fallback_ub_capacity(reason: str, npu_model: str = "") -> int:
+    if _is_ascend_910b(npu_model):
+        warnings.warn(
+            f"Using Ascend910B* fallback UB capacity ({_ASCEND_910B_UB_BYTES} bytes): {reason}",
+            stacklevel=3,
+        )
+        return _ASCEND_910B_UB_BYTES * 8
     warnings.warn(
         f"Using fallback UB capacity ({_FALLBACK_UB_CAPACITY_BITS // 8} bytes): {reason}",
         stacklevel=3,
@@ -251,16 +269,19 @@ class UBManager:
             except ImportError:
                 return _fallback_ub_capacity(
                     "Cannot import tbe.common.platform.get_soc_spec. "
-                    "Source CANN set_env.sh or set ASCEND_UB_CAPACITY_BITS."
+                    "Source CANN set_env.sh or set ASCEND_UB_CAPACITY_BITS.",
+                    npu_model=self._npu_model,
                 )
             except Exception as e:
                 return _fallback_ub_capacity(
                     f"Failed to detect UB capacity from get_soc_spec: {e}. "
-                    "Set ASCEND_UB_CAPACITY_BITS to override."
+                    "Set ASCEND_UB_CAPACITY_BITS to override.",
+                    npu_model=self._npu_model,
                 )
 
         return _fallback_ub_capacity(
-            "NPU is not available. Set ASCEND_UB_CAPACITY_BITS to override."
+            "NPU is not available. Set ASCEND_UB_CAPACITY_BITS to override.",
+            npu_model=self._npu_model,
         )
 
 
@@ -403,6 +424,9 @@ def compute_default_tiling_strategy(
     return tuple(result)
 
 
+# Host-launch hot path: these pure scalar tile computations run per kernel
+# launch, so memoize them (identical args -> identical tile, no device state).
+@functools.lru_cache(maxsize=4096)
 def compute_ub_block_size(
     dim_size: int,
     memory_multiplier: float,
@@ -505,6 +529,7 @@ def compute_activation_block_size(
     return block
 
 
+@functools.lru_cache(maxsize=4096)
 def compute_row_tile_block_size(
     row_dim: int,
     fixed_dim: int,
@@ -579,9 +604,41 @@ def iter_axis_launch_chunks(
         yield offset, min(max_chunks, axis_size - offset)
 
 
+@functools.lru_cache(maxsize=8)
+def _get_npu_properties_cached(device: int) -> dict:
+    return driver.active.utils.get_device_properties(device)
+
+
 def get_npu_properties() -> dict:
-    """Return the triton NPU device properties dict for the current device."""
-    return driver.active.utils.get_device_properties(torch.npu.current_device())
+    """Return the triton NPU device properties dict for the current device.
+
+    Cached per device: this is a fixed hardware property queried on every
+    persistent-launch helper call, and the driver round trip is pure host
+    overhead on the small-T launch-bound path.
+    """
+    return _get_npu_properties_cached(torch.npu.current_device())
+
+
+# Persistent-launch program cap for AIV (vector-core) kernels. triton-ascend
+# reports the vector-core count as device property "num_vectorcore"
+# (= 2 x num_aicore; 48 on the 24-AICore 910B1 production part).
+_AIV_CORE_CAP = 48
+
+
+def get_npu_aiv_core_count() -> int:
+    """AIV (vector-core) count for persistent launches, capped at 48.
+
+    Queries the driver's ``num_vectorcore`` property; falls back to the 910B
+    cap constant when the field is missing (older triton-ascend builds).
+    """
+    try:
+        props = get_npu_properties()
+        count = props.get('num_vectorcore') if hasattr(props, 'get') else None
+    except Exception:
+        count = None
+    if not isinstance(count, int) or count <= 0:
+        count = _AIV_CORE_CAP
+    return min(count, _AIV_CORE_CAP)
 
 
 def _launch_grid_chunked_recursive(

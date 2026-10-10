@@ -482,8 +482,14 @@ def kda_gate_chunk_cumsum(
     chunk_indices: torch.LongTensor | None = None,
     lower_bound: float | None = None,
     use_graph: bool = False,
+    g_t_out: torch.Tensor | None = None,
     **kwargs,
 ) -> torch.Tensor:
+    """chunk-wise gate cumsum. ``g_t_out``: optional preallocated [B, H, T, S]
+    buffer that receives the T-contig copy of the returned gate — the Ascend
+    producer dual-writes it in-kernel; every other backend fills it here with
+    one host transpose (contract: filled on normal return when passed).
+    """
     if cu_seqlens is not None:
         assert g.shape[0] == 1, "Only batch size 1 is supported when cu_seqlens are provided"
     assert len(g.shape) == 4
@@ -512,4 +518,6 @@ def kda_gate_chunk_cumsum(
         REVERSE=False,
         USE_GRAPH=use_graph,
     )
+    if g_t_out is not None:
+        g_t_out.copy_(g.transpose(1, 2))
     return g

@@ -297,6 +297,7 @@ def chunk_local_cumsum_vector(
     output_dtype: torch.dtype | None = torch.float,
     chunk_indices: torch.LongTensor | None = None,
     use_graph: bool = False,
+    g_t_out: torch.Tensor | None = None,
     **kwargs,
 ) -> torch.Tensor:
     if 'head_first' in kwargs:
@@ -330,6 +331,9 @@ def chunk_local_cumsum_vector(
         REVERSE=reverse,
         USE_GRAPH=use_graph,
     )
+    if g_t_out is not None:
+        # non-NPU path of the g_t_out contract: host-fill the head-major copy
+        g_t_out.copy_(g.transpose(1, 2))
     return g
 
 
@@ -448,6 +452,7 @@ def chunk_local_cumsum(
     output_dtype: torch.dtype | None = torch.float,
     chunk_indices: torch.LongTensor | None = None,
     use_graph: bool = False,
+    g_t_out: torch.Tensor | None = None,
     **kwargs,
 ) -> torch.Tensor:
     if 'head_first' in kwargs:
@@ -457,7 +462,7 @@ def chunk_local_cumsum(
     if cu_seqlens is not None:
         assert g.shape[0] == 1, "Only batch size 1 is supported when cu_seqlens are provided"
     if len(g.shape) == 3:
-        return chunk_local_cumsum_scalar(
+        out = chunk_local_cumsum_scalar(
             g=g,
             chunk_size=chunk_size,
             reverse=reverse,
@@ -467,6 +472,9 @@ def chunk_local_cumsum(
             chunk_indices=chunk_indices,
             use_graph=use_graph,
         )
+        if g_t_out is not None:
+            g_t_out.copy_(out.transpose(1, 2))
+        return out
     elif len(g.shape) == 4:
         return chunk_local_cumsum_vector(
             g=g,
@@ -477,6 +485,7 @@ def chunk_local_cumsum(
             output_dtype=output_dtype,
             chunk_indices=chunk_indices,
             use_graph=use_graph,
+            g_t_out=g_t_out,
         )
     else:
         raise ValueError(

@@ -17,6 +17,7 @@ import triton.runtime.driver as driver
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 from fla.ops.utils.op import exp2
 from fla.utils import input_guard
+from fla.utils.launch_fast import fast_launch
 from fla.utils.ascend_ub_manager import (
     ASCEND_MAX_GRID_DIM,
     compute_row_tile_block_size,
@@ -373,10 +374,17 @@ def chunk_fwd_o_npu(
     NV = triton.cdiv(V, BV)
     num_core = get_npu_properties()["num_aicore"]
     task_num = NV * HV * total_chunks
+    # m5 clamp hygiene (in-repo persistent-launch convention, cf. wy_fast /
+    # chunk_intra launchers): never more programs than tasks — degenerate
+    # (task_num >= num_core, byte-identical launch) at every production
+    # shape; under-filled small shapes run one task per program instead of
+    # binding idle blocks for the whole kernel.
+    if 0 < task_num < num_core:
+        num_core = task_num
 
     if g is not None:
         g = g.transpose(1, 2).contiguous()
-    chunk_fwd_kernel_o_npu[(num_core,)](
+    fast_launch(chunk_fwd_kernel_o_npu, (num_core,),
         q=q,
         k=k,
         v=v,
@@ -1348,8 +1356,12 @@ def chunk_bwd_dv_local_npu(
         kernel_kwargs['B'] = B
         num_core = get_npu_properties()["num_aicore"]
         kernel_kwargs['task_num'] = NT * B * HV
+        # m5 clamp hygiene: never more programs than tasks (degenerate at
+        # production shapes; one-task-per-program below).
+        if 0 < kernel_kwargs['task_num'] < num_core:
+            num_core = kernel_kwargs['task_num']
         kernel_kwargs['num_core'] = num_core
-        bwd_kernel[(num_core,)](**kernel_kwargs)
+        fast_launch(bwd_kernel, (num_core,), **kernel_kwargs)
     else:
         kernel_kwargs['BC'] = BC
         kernel_kwargs['NT_OFFSET'] = 0
@@ -1451,8 +1463,12 @@ def chunk_bwd_dqkwg_npu(
         dqkwg_kwargs['B'] = B
         num_core = get_npu_properties()["num_aicore"]
         dqkwg_kwargs['task_num'] = NT * B * HV
+        # m5 clamp hygiene: never more programs than tasks (degenerate at
+        # production shapes; one-task-per-program below).
+        if 0 < dqkwg_kwargs['task_num'] < num_core:
+            num_core = dqkwg_kwargs['task_num']
         dqkwg_kwargs['num_core'] = num_core
-        dqkwg_kernel[(num_core,)](**dqkwg_kwargs)
+        fast_launch(dqkwg_kernel, (num_core,), **dqkwg_kwargs)
     else:
         dqkwg_kwargs['dq_f32'] = dq_f32
         dqkwg_kwargs['dk_f32'] = dk_f32
@@ -1513,7 +1529,12 @@ def chunk_bwd_dqkwg_npu(
         if use_full:
             hdh_bk, hdh_bv = _get_hdh_tiles(K, V)
             num_vec = get_npu_properties()["num_vectorcore"]
-            chunk_bwd_kernel_dg_hdh_npu[(num_vec,)](
+            dg_task_num = NT * B * HV
+            # m5 clamp hygiene: never more programs than tasks (degenerate
+            # at production shapes; one-task-per-program below).
+            if 0 < dg_task_num < num_vec:
+                num_vec = dg_task_num
+            fast_launch(chunk_bwd_kernel_dg_hdh_npu, (num_vec,),
                 h=h,
                 dh=dh,
                 g=g_arg,
@@ -1521,7 +1542,7 @@ def chunk_bwd_dqkwg_npu(
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices,
                 T=T,
-                task_num=NT * B * HV,
+                task_num=dg_task_num,
                 num_core=num_vec,
                 B=B,
                 HV=HV,

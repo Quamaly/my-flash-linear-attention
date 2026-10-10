@@ -17,6 +17,7 @@ from fla.ops.utils.index import prepare_chunk_indices
 from fla.ops.utils.op import exp
 from fla.ops.utils.softplus import softplus
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla.utils.launch_fast import fast_launch
 from fla.utils.ascend_ub_manager import (
     ASCEND_MAX_GRID_DIM,
     compute_row_tile_block_size,
@@ -148,7 +149,8 @@ def _launch_gate_fwd(
         max_h = max_grid_axis_chunks(H, nt_len, max_grid=ASCEND_MAX_GRID_DIM)
         for h_off in range(0, H, max_h):
             h_len = min(max_h, H - h_off)
-            kda_gate_fwd_kernel_npu[(nt_len, h_len)](
+            fast_launch(
+                kda_gate_fwd_kernel_npu, (nt_len, h_len),
                 **kernel_kwargs,
                 NT_OFFSET=nt_off,
                 H_OFFSET=h_off,
@@ -252,7 +254,8 @@ def _launch_gate_bwd(
         max_h = max_grid_axis_chunks(H, nt_len, max_grid=ASCEND_MAX_GRID_DIM)
         for h_off in range(0, H, max_h):
             h_len = min(max_h, H - h_off)
-            kda_gate_bwd_kernel_npu[(nt_len, h_len)](
+            fast_launch(
+                kda_gate_bwd_kernel_npu, (nt_len, h_len),
                 **kernel_kwargs,
                 NT_OFFSET=nt_off,
                 H_OFFSET=h_off,
@@ -265,6 +268,7 @@ def _launch_gate_bwd(
     'HAS_SCALE': lambda args: args['scale'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
     'USE_LOWER_BOUND': lambda args: args['lower_bound'] is not None,
+    'STORE_O_T': lambda args: args['o_t'] is not None,
 })
 @triton.jit(do_not_specialize=['T'])
 def kda_gate_chunk_cumsum_vector_kernel_npu(
@@ -272,6 +276,7 @@ def kda_gate_chunk_cumsum_vector_kernel_npu(
     A_log,
     dt_bias,
     o,
+    o_t,
     scale,
     cu_seqlens,
     chunk_indices,
@@ -287,6 +292,7 @@ def kda_gate_chunk_cumsum_vector_kernel_npu(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    STORE_O_T: tl.constexpr,
     NT_OFFSET: tl.constexpr,
     BH_OFFSET: tl.constexpr,
 ):
@@ -294,6 +300,7 @@ def kda_gate_chunk_cumsum_vector_kernel_npu(
     i_t += NT_OFFSET
     i_bh += BH_OFFSET
     i_b, i_h = i_bh // H, i_bh % H
+    T_seq = T
 
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
@@ -326,6 +333,24 @@ def kda_gate_chunk_cumsum_vector_kernel_npu(
     if HAS_SCALE:
         b_o *= scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    if STORE_O_T:
+        # Head-major [B, H, T, S] dual of the very same tile: the bwd's
+        # T-contig gate copy rides the producer's store (y3 dual-write idiom —
+        # extra store of an already-live register tile, contiguous [BT, BS]
+        # block, identical boundary set) so the host fp32 transpose drops.
+        # Bitwise identical to transpose(1, 2) of the native store above.
+        # Dense: the (b, h) plane starts at i_bh*T_seq (bos is the NATIVE
+        # layout's batch offset — do not add it). Varlen (B==1): bos is the
+        # sequence's global row offset inside the single [H, T_seq, S] planes.
+        if IS_VARLEN:
+            o_t_base = o_t + (tl.cast(i_bh, tl.int64) * T_seq + bos) * S
+        else:
+            o_t_base = o_t + tl.cast(i_bh, tl.int64) * T_seq * S
+        p_o_t = tl.make_block_ptr(
+            o_t_base,
+            (T, S), (S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0),
+        )
+        tl.store(p_o_t, b_o.to(p_o_t.dtype.element_ty), boundary_check=(0, 1))
 
 
 def _launch_gate_chunk_cumsum(
@@ -334,6 +359,7 @@ def _launch_gate_chunk_cumsum(
     A_log: torch.Tensor | None,
     dt_bias: torch.Tensor | None,
     o: torch.Tensor,
+    o_t: torch.Tensor | None = None,
     scale: float | None,
     cu_seqlens: torch.LongTensor | None,
     chunk_indices: torch.LongTensor | None,
@@ -354,6 +380,7 @@ def _launch_gate_chunk_cumsum(
         A_log=A_log,
         dt_bias=dt_bias,
         o=o,
+        o_t=o_t,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -379,7 +406,7 @@ def _launch_gate_chunk_cumsum(
         for bh_off in range(0, bh_total, max_bh):
             bh_len = min(max_bh, bh_total - bh_off)
             kernel_kwargs['BH_OFFSET'] = bh_off
-            kda_gate_chunk_cumsum_vector_kernel_npu[(ns, nt_len, bh_len)](**kernel_kwargs)
+            fast_launch(kda_gate_chunk_cumsum_vector_kernel_npu, (ns, nt_len, bh_len), **kernel_kwargs)
 
 
 @input_guard
@@ -441,6 +468,12 @@ def kda_gate_bwd_npu(
     return dg, dA, dbias
 
 
+# Permanent failure latch for the head-major o_t dual store: once a dual
+# launch fails, every later call takes the proven single-store path and the
+# caller's g_t_out is filled by the plain host transpose instead.
+_G_T_DUAL_FAILED = False
+
+
 @input_guard
 def kda_gate_chunk_cumsum_npu(
     g: torch.Tensor,
@@ -452,6 +485,7 @@ def kda_gate_chunk_cumsum_npu(
     output_dtype: torch.dtype | None = torch.float,
     chunk_indices: torch.LongTensor | None = None,
     lower_bound: float | None = None,
+    g_t_out: torch.Tensor | None = None,
     **kwargs,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
@@ -466,11 +500,49 @@ def kda_gate_chunk_cumsum_npu(
 
     BS = _get_chunk_cumsum_bs(BT, S)
     g_org, o = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
+    global _G_T_DUAL_FAILED
+    # g_t_out contract: on normal return the buffer holds the T-contig
+    # [B, H, T, S] copy of o. Fast path = in-kernel dual store (STORE_O_T);
+    # on any dual failure (permanent latch) or an out-of-contract buffer the
+    # proven single-store launch runs and the host transpose fills the buffer.
+    dual_ok = (
+        g_t_out is not None
+        and not _G_T_DUAL_FAILED
+        and g_t_out.dtype == o.dtype
+        and g_t_out.is_contiguous()
+        and tuple(g_t_out.shape) == (B, H, T, S)
+        and g_t_out.device == o.device
+    )
+    if dual_ok:
+        try:
+            _launch_gate_chunk_cumsum(
+                s=g_org,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                o=o,
+                o_t=g_t_out,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                lower_bound=lower_bound,
+                T=T,
+                B=B,
+                H=H,
+                S=S,
+                BT=BT,
+                BS=BS,
+                NT=NT,
+                reverse=False,
+            )
+            return o
+        except Exception:
+            _G_T_DUAL_FAILED = True
     _launch_gate_chunk_cumsum(
         s=g_org,
         A_log=A_log,
         dt_bias=dt_bias,
         o=o,
+        o_t=None,
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
@@ -484,6 +556,8 @@ def kda_gate_chunk_cumsum_npu(
         NT=NT,
         reverse=False,
     )
+    if g_t_out is not None:
+        g_t_out.copy_(o.transpose(1, 2))
     return o
 
 

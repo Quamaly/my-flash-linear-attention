@@ -765,7 +765,17 @@ def chunk_gated_delta_rule_bwd_dhu(
     chunk_indices: torch.LongTensor | None = None,
     chunk_offsets: torch.LongTensor | None = None,
     use_graph: bool = False,
+    dv2_t_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # dv2_t_layout is an Ascend-only epilogue hint: the triton-ascend kernel
+    # can emit du as a [B, HV, T, V] storage view so its consumers skip the
+    # host transpose. This portable kernel ignores it and keeps the native
+    # [B, T, HV, V] output layout.
+    # Layout handoff guard: on a mixed dispatch the Ascend dAv producer may
+    # hand over dv as a [B, HV, T, V] storage view; this kernel indexes dv
+    # with native strides, so normalize first (no-op for contiguous inputs).
+    if not dv.is_contiguous():
+        dv = dv.contiguous()
     B, T, H, K, V, HV = *q.shape, do.shape[-1], do.shape[2]
     # N: the actual number of sequences in the batch with either equal or variable lengths
     BT = chunk_size

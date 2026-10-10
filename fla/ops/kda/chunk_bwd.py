@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -21,7 +23,7 @@ from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.graph import get_static_buffer
 from fla.ops.utils.op import exp2
-from fla.utils import IS_NVIDIA_HOPPER, IS_NVIDIA_SM100, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_NPU, IS_NVIDIA_HOPPER, IS_NVIDIA_SM100, autotune_cache_kwargs, check_shared_mem
 
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BV_LIST = [64, 128] if check_shared_mem('ampere') else [16, 32]
@@ -402,6 +404,12 @@ def chunk_kda_bwd_wy_dqkg_fused(
     B, T, H, K, HV, V = *k.shape, v.shape[2], v.shape[-1]
     BT = chunk_size
 
+    # Layout handoff guard: on a mixed dispatch the Ascend dhu stage may hand
+    # over du as a [B, HV, T, V] storage view; this kernel indexes dv with
+    # native strides, so normalize first (no-op for contiguous inputs).
+    if not dv.is_contiguous():
+        dv = dv.contiguous()
+
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -457,6 +465,65 @@ def chunk_kda_bwd_wy_dqkg_fused(
     return dq, dk, dv, db, dg, dA
 
 
+_BWD_G_T_DUAL_ENV = 'FLA_KDA_BWD_G_DUAL'
+
+
+def _bwd_g_t_dual_buf(g: torch.Tensor, HV: int, chunk_size: int) -> torch.Tensor | None:
+    """Preallocate the head-major [B, HV, T, K] copy of the cumsum'd gate for
+    the NPU gate producer to dual-write (kda_gate_chunk_cumsum g_t_out/STORE_O_T,
+    w4/y3 doctrine: the existing producer stores a second, transposed copy of
+    its already-live output tile). This kills the bwd's host fp32 transpose of
+    g (~1.7ms @t128k) without touching any consumer layout.
+
+    Gated exactly like _bwd_t_contig_prep (IS_NPU & HV>1 & chunk_size%16==0,
+    i.e. the wy verifier mirror) plus FLA_KDA_BWD_G_DUAL=0 opt-out. None means
+    the host-transpose fallback path runs unchanged.
+    """
+    if (IS_NPU and HV > 1 and chunk_size % 16 == 0
+            and os.environ.get(_BWD_G_T_DUAL_ENV, '1').strip().lower() not in ('0', 'false', 'off')):
+        B, T, H, S = g.shape
+        return g.new_empty(B, H, T, S, dtype=torch.float)
+    return None
+
+
+def _bwd_t_contig_prep(
+    g: torch.Tensor | None,
+    beta: torch.Tensor | None,
+    HV: int,
+    chunk_size: int,
+    g_t_dual: torch.Tensor | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """One host transpose of the gate/beta for every T-contig NPU consumer in
+    the bwd chain (recompute_w_u + the wy dw/k parts read [B, H, T, ...] via
+    G_T_CONTIG); the native-layout consumers (dhu, bwd_intra) keep ``g``/``beta``.
+
+    When ``g_t_dual`` (the producer-written head-major gate copy) is present
+    and layout-valid it IS the transposed copy — the gate's host transpose
+    drops; the gate producer honors the fill contract on every backend, and
+    its NPU launcher additionally latches to the plain launch + host copy on
+    any dual failure. beta keeps its host transpose (user input, no in-tree
+    producer, ~28us @t128k).
+
+    Gated on IS_NPU exactly like backend dispatch selection (is_available), so
+    the CUDA path is untouched. chunk_size % 16 mirrors the wy verifier: if the
+    NPU wy impl would be rejected (mainline fallback, native-pointer math), the
+    native tensors are passed instead. recompute's verifier is always True.
+    Layout-aware *_t_contig_arg helpers in the NPU launchers pass these through
+    instead of re-transposing. Must run AFTER any gate recomputation (``g``
+    reassignment in the use_gate_in_kernel path).
+    """
+    if IS_NPU and HV > 1 and chunk_size % 16 == 0:
+        if g is not None and g_t_dual is not None and g_t_dual.is_contiguous() \
+                and tuple(g_t_dual.shape) == (g.shape[0], g.shape[2], g.shape[1], g.shape[3]) \
+                and g_t_dual.dtype == torch.float:
+            g_t = g_t_dual
+        else:
+            g_t = g.transpose(1, 2).contiguous() if g is not None else None
+        beta_t = beta.transpose(1, 2).contiguous() if beta is not None else None
+        return g_t, beta_t
+    return None, None
+
+
 def chunk_kda_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -469,6 +536,7 @@ def chunk_kda_bwd(
     do: torch.Tensor,
     dht: torch.Tensor,
     g: torch.Tensor | None = None,
+    g_t: torch.Tensor | None = None,
     g_org: torch.Tensor | None = None,
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
@@ -483,13 +551,18 @@ def chunk_kda_bwd(
     cp_context: FLACPContext | None = None,
     use_graph: bool = False,
     chunk_offsets: torch.LongTensor | None = None,
+    dg_dtype: torch.dtype | None = None,
     **kwargs,
 ):
     H, HV = q.shape[2], v.shape[2]
     G = HV // H
 
+    g_t_dual = None
     if disable_recompute is False:
         if use_gate_in_kernel:
+            # Producer-side dual write of the T-contig gate copy (kills the
+            # bwd's host fp32 g transpose; every consumer layout unchanged).
+            g_t_dual = _bwd_g_t_dual_buf(g_org, HV, chunk_size)
             g = kda_gate_chunk_cumsum(
                 g=g_org,
                 A_log=A_log,
@@ -500,14 +573,20 @@ def chunk_kda_bwd(
                 chunk_indices=chunk_indices,
                 lower_bound=lower_bound,
                 use_graph=use_graph,
+                g_t_out=g_t_dual,
             )
+        # after any gate recomputation: transposed copies match the final g
+        g_t, beta_t = _bwd_t_contig_prep(
+            g, beta, HV, chunk_size,
+            g_t_dual if use_gate_in_kernel else g_t,
+        )
         w, u, qg, kg = recompute_w_u_fwd(
             q=q,
             k=k,
             v=v,
-            beta=beta,
+            beta=beta_t if beta_t is not None else beta,
             A=Akk,
-            gk=g,
+            gk=g_t if g_t is not None else g,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             use_graph=use_graph,
@@ -529,8 +608,18 @@ def chunk_kda_bwd(
             chunk_size=chunk_size,
             state_v_first=state_v_first,
         )
+        # NOTE: stage intermediates (u, w, qg, kg, v_new, h, dh, dAqk/dAkk,
+        # the cumsum'd g) are deliberately NOT freed as their last reader
+        # completes. Deleting NPU tensors mid-stream while async kernels may
+        # still be in flight triggers runtime 507015 crashes, so the extra
+        # peak-HBM cost is accepted.
     else:
         w, u, qg, kg, v_new, h = kwargs["w"], kwargs["u"], kwargs["qg"], kwargs["kg"], kwargs["v_new"], kwargs["h"]
+        # g_t: fwd-retained producer-written head-major gate copy (w4
+        # dual-store, FLA_KDA_ATEM_FUSE) — when present and valid the bwd's
+        # host fp32 gate transpose (~1.7ms @t128k) drops; _bwd_t_contig_prep
+        # validates it and falls back to the host transpose otherwise.
+        g_t, beta_t = _bwd_t_contig_prep(g, beta, HV, chunk_size, g_t)
         if cp_context is not None:
             # Restore the full initial_state tensor from the compressed version.
             # Only the first sequence's state is non-zero as it's the only one that could be cross-rank.
@@ -586,6 +675,10 @@ def chunk_kda_bwd(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
         state_v_first=state_v_first,
+        # Ascend only: emit du in the [B, HV, T, V] layout the wy stage reads
+        # so the host transpose between dhu and wy becomes a zero-copy view.
+        # The portable/CUDA kernel ignores the hint.
+        dv2_t_layout=IS_NPU,
     )
 
     dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(
@@ -593,8 +686,8 @@ def chunk_kda_bwd(
         k=k,
         v=v,
         v_new=v_new,
-        g=g,
-        beta=beta,
+        g=g_t if g_t is not None else g,
+        beta=beta_t if beta_t is not None else beta,
         A=Akk,
         h=h,
         do=do,
@@ -632,6 +725,10 @@ def chunk_kda_bwd(
         dk = dk.view(*dk.shape[:2], H, G, dk.shape[-1]).sum(dim=3)
 
     dA, dbias = None, None
+    # When the gate backward does not consume dg (use_gate_in_kernel=False),
+    # the only consumer is the autograd return cast `dg.to(g_input)`: storing
+    # the reverse cumsum directly in the grad dtype keeps the single
+    # fp32->dtype rounding (bit-identical) and drops that full-tensor cast.
     dg = chunk_local_cumsum(
         dg,
         chunk_size=chunk_size,
@@ -639,6 +736,7 @@ def chunk_kda_bwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_graph=use_graph,
+        output_dtype=dg_dtype,
     )
     if use_gate_in_kernel:
         dg, dA, dbias = kda_gate_bwd(

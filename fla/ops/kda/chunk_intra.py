@@ -817,7 +817,32 @@ def chunk_kda_fwd_intra(
     safe_gate: bool = False,
     disable_recompute: bool = False,
     use_graph: bool = False,
+    store_qg_scaled: bool = False,
+    qk_l2norm_out: dict | None = None,
+    g_raw: torch.Tensor | None = None,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+    use_gate_in_kernel: bool = False,
+    gate_scale: float | None = None,
+    gk_t: torch.Tensor | None = None,
 ):
+    # g_raw..gate_scale are consumed by the Ascend NPU backend's decay-table
+    # prologue (w2, y7 port); other backends ignore them.
+    if qk_l2norm_out is not None:
+        # The caller skipped its standalone l2norm because the Ascend persistent
+        # intra kernel folds it; landing here means dispatch fell back to this
+        # generic implementation. Run the host l2norm and fill the caller's
+        # buffers (normalized q/k plus the [B, H, T] rstd working layout) so
+        # every downstream consumer still sees normalized q/k.
+        from fla.modules.l2norm import l2norm_fwd
+        q_n, q_rstd = l2norm_fwd(q)
+        k_n, k_rstd = l2norm_fwd(k)
+        qk_l2norm_out['q'], qk_l2norm_out['k'] = q_n, k_n
+        qk_l2norm_out['q_rstd'].copy_(q_rstd.transpose(1, 2))
+        qk_l2norm_out['k_rstd'].copy_(k_rstd.transpose(1, 2))
+        q, k = q_n, k_n
+        qk_l2norm_out = None
     B, T, H, K, HV = *k.shape, gk.shape[2]
     BT = chunk_size
     if BT not in (32, 64):
@@ -904,11 +929,15 @@ def chunk_kda_fwd_intra(
         A=Akk,
         q=q if disable_recompute else None,
         gk=gk,
+        gk_t=gk_t,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         use_graph=use_graph,
     )
-    return w, u, qg, kg, Aqk, Akk
+    # qg_scaled (producer-precomputed bf16(q * exp2(g) * scale) for the NPU
+    # fused h+o tail) is an Ascend-backend extension; the mainline WY kernel
+    # does not produce it and the tail is NPU-only, so it returns None here.
+    return w, u, qg, kg, Aqk, Akk, None
 
 
 @dispatch('kda')

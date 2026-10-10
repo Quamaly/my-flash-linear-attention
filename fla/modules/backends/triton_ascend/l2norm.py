@@ -15,8 +15,10 @@ from fla.utils.ascend_ub_manager import (
     ASCEND_MAX_GRID_DIM,
     compute_row_tile_block_size,
     compute_ub_block_size,
+    get_npu_aiv_core_count,
     iter_axis_launch_chunks,
 )
+from fla.utils.launch_fast import fast_launch
 
 # Peak live fp32 tiles relative to [BT, BD].
 # Forward keeps ~b_x/b_y; backward keeps b_y/b_dy/b_dx plus reduction temps.
@@ -86,6 +88,35 @@ def l2norm_fwd_kernel(
 
 
 @triton.jit(do_not_specialize=['T'])
+def l2norm_fwd_kernel_persistent(
+    x,
+    y,
+    rstd,
+    eps,
+    T,
+    D: tl.constexpr,
+    BD: tl.constexpr,
+    BT: tl.constexpr,
+):
+    # Persistent AIV twin of l2norm_fwd_kernel: a single launch of at most
+    # num_vectorcore (48) programs, each striding the NT = cdiv(T, BT) task
+    # space; per-task math is identical to the split-launch kernel.
+    core_id = tl.program_id(0)
+    task_num = tl.cdiv(T, BT)
+    for i_t in tl.range(core_id, task_num, tl.num_programs(0)):
+        rows = tl.cast(i_t, tl.int64) * BT + tl.arange(0, BT)
+        cols = tl.arange(0, BD)
+        mask = (rows[:, None] < T) & (cols[None, :] < D)
+
+        b_x = tl.load(x + rows[:, None] * D + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+        b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x, 1) + eps)
+        b_y = b_x * b_rstd[:, None]
+
+        tl.store(y + rows[:, None] * D + cols[None, :], b_y.to(y.dtype.element_ty), mask=mask)
+        tl.store(rstd + rows, b_rstd.to(rstd.dtype.element_ty), mask=rows < T)
+
+
+@triton.jit(do_not_specialize=['T'])
 def l2norm_bwd_kernel(
     y,
     rstd,
@@ -109,6 +140,11 @@ def l2norm_bwd_kernel(
     tl.store(dx + rows[:, None] * D + cols[None, :], b_dx.to(dx.dtype.element_ty), mask=mask)
 
 
+def _dense_rows(t: torch.Tensor, T: int, D: int) -> bool:
+    """Contiguous aligned rows: unit-stride columns packed at row stride D."""
+    return t.stride(-1) == 1 and (T <= 1 or t.stride(-2) == D)
+
+
 def _launch_l2norm_fwd_kernel(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -120,8 +156,25 @@ def _launch_l2norm_fwd_kernel(
     BT: int,
 ):
     NT = triton.cdiv(T, BT)
+    if NT > 0 and _dense_rows(x, T, D) and _dense_rows(y, T, D):
+        # kda/production path: one persistent launch, at most one program per
+        # AIV (vector) core; each program strides the NT task space.
+        num_core = min(get_npu_aiv_core_count(), NT)
+        fast_launch(
+            l2norm_fwd_kernel_persistent, (num_core,),
+            x=x,
+            y=y,
+            rstd=rstd,
+            eps=eps,
+            T=T,
+            D=D,
+            BD=BD,
+            BT=BT,
+        )
+        return
     for nt_off, nt_len in iter_axis_launch_chunks(NT, 1, max_grid=ASCEND_MAX_GRID_DIM):
-        l2norm_fwd_kernel[(nt_len,)](
+        fast_launch(
+            l2norm_fwd_kernel, (nt_len,),
             x=x,
             y=y,
             rstd=rstd,
@@ -146,7 +199,8 @@ def _launch_l2norm_bwd_kernel(
 ):
     NT = triton.cdiv(T, BT)
     for nt_off, nt_len in iter_axis_launch_chunks(NT, 1, max_grid=ASCEND_MAX_GRID_DIM):
-        l2norm_bwd_kernel[(nt_len,)](
+        fast_launch(
+            l2norm_bwd_kernel, (nt_len,),
             y=y,
             rstd=rstd,
             dy=dy,
